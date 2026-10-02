@@ -8,7 +8,9 @@ from .views import (
     VarietyListView, VarietyDetailView, VarietyBatchDeleteView,
     VarietyTemplateView, VarietyImportView,
     DashboardView, GoodsListView, StockInListView, StockOutListView,
-    WarningListView, ApprovalListView
+    WarningListView, ApprovalListView,
+    StockInCommandView, ReleaseCommandView, FreezeCommandView,
+    CorrectionCommandView, BusinessEventStreamView,
 )
 
 urlpatterns = [
@@ -48,4 +50,13 @@ urlpatterns = [
     
     # 审批管理
     path('approvals/', ApprovalListView.as_view(), name='approval-list'),
+
+    # 业务命令（写入即发布业务事件）
+    path('commands/stock-in/', StockInCommandView.as_view(), name='command-stock-in'),
+    path('commands/release/', ReleaseCommandView.as_view(), name='command-release'),
+    path('commands/freeze/', FreezeCommandView.as_view(), name='command-freeze'),
+    path('commands/correction/', CorrectionCommandView.as_view(), name='command-correction'),
+
+    # 业务事件流（按数据库提交顺序游标拉取）
+    path('events/', BusinessEventStreamView.as_view(), name='business-event-stream'),
 ]

@@ -10,13 +10,23 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from apps.core.response import success_response, error_response
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    BUSINESS_EVENT_TYPE_KEYS,
+)
 from .serializers import (
     UnitSerializer, UnitCreateSerializer,
     CategorySerializer, CategoryCreateSerializer,
     VarietySerializer, VarietyCreateSerializer,
     GoodsSerializer, StockInSerializer, StockOutSerializer,
-    WarningSerializer, ApprovalSerializer
+    WarningSerializer, ApprovalSerializer,
+    StockInCommandSerializer, ReleaseCommandSerializer,
+    StockFreezeSerializer, StockCorrectionSerializer,
+    BusinessEventSerializer,
+)
+from .services import (
+    BusinessError, StaleCursor, record_stock_in, record_release,
+    record_freeze, record_correction, read_events,
 )
 
 logger = logging.getLogger('apps')
@@ -628,11 +638,217 @@ class WarningListView(APIView):
 class ApprovalListView(APIView):
     """审批记录列表视图"""
     permission_classes = [IsAuthenticated]
-    
+
     def get(self, request):
         return success_response(data={
             'list': [],
             'total': 0,
             'page': 1,
             'page_size': 10
+        })
+
+
+# ==================== 业务命令（写入即发布事件） ====================
+
+def _load_goods_or_error(goods_id):
+    try:
+        return Goods.objects.get(pk=goods_id), None
+    except Goods.DoesNotExist:
+        return None, error_response(message='货物不存在', code=404)
+
+
+def _first_serializer_error(serializer):
+    errors = serializer.errors
+    first_error = list(errors.values())[0]
+    if isinstance(first_error, list):
+        first_error = first_error[0]
+    return str(first_error)
+
+
+class StockInCommandView(APIView):
+    """入库命令：登记入库单并发布 stock_in 事件。"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = StockInCommandSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_serializer_error(serializer))
+        data = serializer.validated_data
+
+        goods, error = _load_goods_or_error(data['goods'])
+        if error:
+            return error
+
+        try:
+            event, created = record_stock_in(
+                goods=goods, operator=request.user, quantity=data['quantity'],
+                batch_no=data['batch_no'], supplier=data['supplier'],
+                remark=data['remark'], idempotency_key=data.get('idempotency_key') or None,
+            )
+        except BusinessError as exc:
+            return error_response(message=str(exc))
+
+        return success_response(
+            data=BusinessEventSerializer(event).data,
+            message='入库成功' if created else '事件已存在（幂等命中）',
+        )
+
+
+class ReleaseCommandView(APIView):
+    """放行命令：登记已完成出库单并发布 release 事件。"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = ReleaseCommandSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_serializer_error(serializer))
+        data = serializer.validated_data
+
+        goods, error = _load_goods_or_error(data['goods'])
+        if error:
+            return error
+
+        try:
+            event, created = record_release(
+                goods=goods, operator=request.user, quantity=data['quantity'],
+                receiver=data['receiver'], receiver_dept=data['receiver_dept'],
+                remark=data['remark'], idempotency_key=data.get('idempotency_key') or None,
+            )
+        except BusinessError as exc:
+            return error_response(message=str(exc))
+
+        return success_response(
+            data=BusinessEventSerializer(event).data,
+            message='放行成功' if created else '事件已存在（幂等命中）',
+        )
+
+
+class FreezeCommandView(APIView):
+    """冻结/解冻命令并发布 freeze 事件。"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = StockFreezeSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_serializer_error(serializer))
+        data = serializer.validated_data
+
+        goods, error = _load_goods_or_error(data['goods'])
+        if error:
+            return error
+
+        try:
+            event, created = record_freeze(
+                goods=goods, operator=request.user, action=data['action'],
+                quantity=data['quantity'], reason=data['reason'],
+                idempotency_key=data.get('idempotency_key') or None,
+            )
+        except BusinessError as exc:
+            return error_response(message=str(exc))
+
+        return success_response(
+            data=BusinessEventSerializer(event).data,
+            message='冻结操作成功' if created else '事件已存在（幂等命中）',
+        )
+
+
+class CorrectionCommandView(APIView):
+    """库存更正命令并发布 correction 事件。"""
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = StockCorrectionSerializer(data=request.data)
+        if not serializer.is_valid():
+            return error_response(message=_first_serializer_error(serializer))
+        data = serializer.validated_data
+
+        goods, error = _load_goods_or_error(data['goods'])
+        if error:
+            return error
+
+        try:
+            event, created = record_correction(
+                goods=goods, operator=request.user,
+                quantity_after=data['quantity_after'], reason=data['reason'],
+                remark=data['remark'], idempotency_key=data.get('idempotency_key') or None,
+            )
+        except BusinessError as exc:
+            return error_response(message=str(exc))
+
+        return success_response(
+            data=BusinessEventSerializer(event).data,
+            message='库存更正成功' if created else '事件已存在（幂等命中）',
+        )
+
+
+# ==================== 业务事件流（按数据库提交顺序读取） ====================
+
+DEFAULT_EVENT_LIMIT = 100
+MAX_EVENT_LIMIT = 1000
+
+
+class BusinessEventStreamView(APIView):
+    """业务事件流：按 sequence（提交顺序）游标分页拉取。
+
+    查询参数：
+    - cursor：已确认的最大事件序号，首次不传或传 0；
+    - limit：每页条数（1~1000，默认 100）；
+    - event_type：逗号分隔，仅拉取指定类型（stock_in/release/freeze/correction）。
+
+    权限裁剪（管理员看全部，普通用户仅本人操作的事件）只做行级过滤，
+    不参与编号，游标始终是全局绝对序号，单调不漏；游标过旧返回
+    410 与可恢复边界。
+    """
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        try:
+            cursor = int(request.query_params.get('cursor', 0))
+            limit = int(request.query_params.get('limit', DEFAULT_EVENT_LIMIT))
+        except (TypeError, ValueError):
+            return error_response(message='cursor 和 limit 必须是整数')
+
+        if cursor < 0:
+            return error_response(message='cursor 不能为负数')
+        if not 1 <= limit <= MAX_EVENT_LIMIT:
+            return error_response(message=f'limit 取值范围为 1~{MAX_EVENT_LIMIT}')
+
+        event_types = None
+        raw_types = request.query_params.get('event_type')
+        if raw_types:
+            event_types = [item.strip() for item in raw_types.split(',') if item.strip()]
+            invalid = set(event_types) - BUSINESS_EVENT_TYPE_KEYS
+            if invalid:
+                return error_response(message=f"未知事件类型：{','.join(sorted(invalid))}")
+
+        # 数据权限裁剪：普通用户仅能看到本人操作的事件。
+        operator_id = None
+        if not request.user.is_admin:
+            operator_id = request.user.id
+
+        try:
+            events, next_cursor, has_more, (earliest, latest) = read_events(
+                cursor=cursor, limit=limit,
+                event_types=event_types, operator_id=operator_id,
+            )
+        except StaleCursor as exc:
+            # 410 Gone：游标落在保留窗口之外，给出可恢复边界。
+            return error_response(
+                message='游标已过期，事件已超出保留范围，请使用 resume_cursor 重新对齐',
+                code=410,
+                data={
+                    'cursor': exc.cursor,
+                    'earliest_sequence': exc.earliest_sequence,
+                    'latest_sequence': exc.latest_sequence,
+                    'resume_cursor': exc.earliest_sequence - 1,
+                },
+            )
+
+        return success_response(data={
+            'events': BusinessEventSerializer(events, many=True).data,
+            'next_cursor': next_cursor,
+            'has_more': has_more,
+            'earliest_sequence': earliest,
+            'latest_sequence': latest,
+            'limit': limit,
         })

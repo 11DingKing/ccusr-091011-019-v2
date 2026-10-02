@@ -2,7 +2,10 @@
 仓库管理序列化器
 """
 from rest_framework import serializers
-from .models import Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval
+from .models import (
+    Unit, Category, Variety, Goods, StockIn, StockOut, Warning, Approval,
+    BusinessEvent,
+)
 
 
 class UnitSerializer(serializers.ModelSerializer):
@@ -193,10 +196,68 @@ class ApprovalSerializer(serializers.ModelSerializer):
     """审批记录序列化器"""
     approver_name = serializers.CharField(source='approver.username', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
-    
+
     class Meta:
         model = Approval
         fields = [
             'id', 'stock_out', 'approver', 'approver_name',
             'status', 'status_display', 'remark', 'created_at', 'updated_at'
+        ]
+
+
+class StockFreezeSerializer(serializers.Serializer):
+    """冻结/解冻命令序列化器"""
+    goods = serializers.IntegerField(required=True)
+    action = serializers.ChoiceField(choices=[('freeze', '冻结'), ('unfreeze', '解冻')])
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2)
+    reason = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    idempotency_key = serializers.CharField(max_length=100, required=False, allow_blank=False)
+
+
+class StockCorrectionSerializer(serializers.Serializer):
+    """库存更正命令序列化器"""
+    goods = serializers.IntegerField(required=True)
+    quantity_after = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0)
+    reason = serializers.ChoiceField(
+        choices=[('check', '盘点更正'), ('damage', '损毁核销'), ('system', '系统订正'), ('other', '其他')],
+        default='check', required=False,
+    )
+    remark = serializers.CharField(required=False, allow_blank=True, default='')
+    idempotency_key = serializers.CharField(max_length=100, required=False, allow_blank=False)
+
+
+class StockInCommandSerializer(serializers.Serializer):
+    """入库命令序列化器"""
+    goods = serializers.IntegerField(required=True)
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0)
+    batch_no = serializers.CharField(max_length=50, required=False, allow_blank=True, default='')
+    supplier = serializers.CharField(max_length=200, required=False, allow_blank=True, default='')
+    remark = serializers.CharField(required=False, allow_blank=True, default='')
+    idempotency_key = serializers.CharField(max_length=100, required=False, allow_blank=False)
+
+
+class ReleaseCommandSerializer(serializers.Serializer):
+    """放行命令序列化器"""
+    goods = serializers.IntegerField(required=True)
+    quantity = serializers.DecimalField(max_digits=12, decimal_places=2, min_value=0)
+    receiver = serializers.CharField(max_length=100)
+    receiver_dept = serializers.CharField(max_length=100, required=False, allow_blank=True, default='')
+    remark = serializers.CharField(required=False, allow_blank=True, default='')
+    idempotency_key = serializers.CharField(max_length=100, required=False, allow_blank=False)
+
+
+class BusinessEventSerializer(serializers.ModelSerializer):
+    """业务事件序列化器"""
+    event_type_display = serializers.CharField(source='get_event_type_display', read_only=True)
+    goods_code = serializers.CharField(source='goods.code', read_only=True)
+    goods_name = serializers.CharField(source='goods.name', read_only=True)
+    operator_name = serializers.CharField(source='operator.username', read_only=True)
+
+    class Meta:
+        model = BusinessEvent
+        fields = [
+            'sequence', 'event_type', 'event_type_display',
+            'source_table', 'source_id',
+            'goods', 'goods_code', 'goods_name',
+            'operator', 'operator_name', 'payload', 'created_at',
         ]
